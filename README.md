@@ -38,14 +38,15 @@ pip install blackboxprotobuf
 python agy_p.py "あなたの質問"
 ```
 
-### 会話を継続する（`--continue`）
+### 会話を継続する
 
 ```bash
 python agy_p.py "最初のメッセージ"
-python agy_p.py -c "続きのメッセージ"   # 直前の会話を継続
+python agy_p.py -c "続きのメッセージ"                          # 直前の会話を継続
+python agy_p.py --conversation "$(cat /tmp/id.txt)" "次の質問"  # 特定の会話を継続
 ```
 
-### 会話IDを使って特定の会話を継続する
+### 会話IDを保存して後から再開する
 
 ```bash
 # 新規会話 — IDをファイルに保存
@@ -56,32 +57,65 @@ python agy_p.py "最初のメッセージ" --id-file /tmp/conv.txt
 python agy_p.py --conversation "$(cat /tmp/conv.txt)" "続きのメッセージ"
 ```
 
-### 複数の会話を並行して管理する
+### ワークスペースにディレクトリを追加する
 
 ```bash
-# 会話A
-python agy_p.py "好きな色は青です" --id-file /tmp/conv_a.txt
+# 単一ディレクトリ
+python agy_p.py --add-dir ./src "src ディレクトリの .py ファイルを列挙して"
 
-# 会話B（独立したコンテキスト）
-python agy_p.py "好きな数字は42です" --id-file /tmp/conv_b.txt
-
-# 会話Aに戻る
-python agy_p.py --conversation "$(cat /tmp/conv_a.txt)" "好きな色は何でしたか？"
-# → "青" と返答（会話Bの内容は含まれない）
-
-# 会話Bに戻る
-python agy_p.py --conversation "$(cat /tmp/conv_b.txt)" "好きな色と数字は？"
-# → 色は知らないが数字は42と返答
+# 複数ディレクトリ（繰り返し指定可）
+python agy_p.py --add-dir ./src --add-dir ./tests "テストカバレッジを確認して"
 ```
 
-### オプション一覧
+### ツール確認を全スキップする
+
+```bash
+python agy_p.py --dangerously-skip-permissions "ファイルを編集して"
+```
+
+### サンドボックスモードで実行する
+
+```bash
+python agy_p.py --sandbox "コードを実行して結果を教えて"
+```
+
+### タイムアウトを調整する
+
+```bash
+# agy 内部タイムアウト（デフォルト 5m0s）
+python agy_p.py --print-timeout 30s "簡単な質問"
+python agy_p.py --print-timeout 10m0s "複雑な処理"
+
+# プロセス強制終了タイムアウト（デフォルト 360 秒）
+python agy_p.py --kill-timeout 600 "時間のかかる処理"
+```
+
+### ログファイルを指定する
+
+```bash
+python agy_p.py --log-file /tmp/agy.log "質問"
+```
+
+## オプション一覧
+
+### agy に転送されるフラグ
 
 | オプション | 説明 |
 |-----------|------|
 | `-c` / `--continue` | 直前の会話を継続 |
-| `--conversation ID` | 指定したUUIDの会話を継続 |
-| `--id-file PATH` | 新規会話のIDをファイルに保存 |
-| `--timeout N` | タイムアウト秒数（デフォルト: 120） |
+| `--conversation ID` | 指定した UUID の会話を継続 |
+| `--add-dir PATH` | ワークスペースにディレクトリを追加（複数回指定可） |
+| `--dangerously-skip-permissions` | ツール確認を全スキップ |
+| `--log-file PATH` | agy のログ出力先を上書き |
+| `--print-timeout DURATION` | agy 内部の print モードタイムアウト（例: `30s`, `5m0s`） |
+| `--sandbox` | サンドボックスモードで実行 |
+
+### ラッパー独自フラグ（agy には転送されない）
+
+| オプション | 説明 |
+|-----------|------|
+| `--id-file PATH` | 新規会話の UUID をファイルに保存 |
+| `--kill-timeout N` | プロセス強制終了までの秒数（デフォルト: 360） |
 
 ## 動作環境
 

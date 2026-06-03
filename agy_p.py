@@ -3,20 +3,33 @@
 agy_p.py — agy -p wrapper that actually prints the response to stdout.
 
 Usage:
-    python agy_p.py "your prompt here"
-    python agy_p.py -c "follow-up"                    # continue last conversation
-    python agy_p.py --conversation ID "follow-up"     # continue specific conversation
-    python agy_p.py "first message" --id-file id.txt  # save conv ID for later
+    python agy_p.py "your prompt"
+    python agy_p.py -c "follow-up"
+    python agy_p.py --conversation ID "follow-up"
+    python agy_p.py --add-dir ./src --add-dir ./tests "your prompt"
+    python agy_p.py --dangerously-skip-permissions "your prompt"
+    python agy_p.py --print-timeout 30s "your prompt"
+    python agy_p.py --sandbox "your prompt"
+    python agy_p.py --log-file /tmp/agy.log "your prompt"
+    python agy_p.py "first message" --id-file /tmp/id.txt
 
 Root cause of the bug (agy v1.0.4):
     printmode_manager.go silently drops responses when PlannerResponse has no
     ModifiedResponse. The actual text is saved to the SQLite conversation DB
     (gen_metadata table) even when stdout gets nothing. This script reads it back.
 
-Conversation ID notes:
-    - New conversation: ID is printed to stderr as "CONV_ID: {uuid}"
-    - Use --id-file to capture it: agy_p.py "hi" --id-file /tmp/id.txt
-    - Resume later: agy_p.py --conversation $(cat /tmp/id.txt) "follow-up"
+Flags forwarded to agy:
+    -c / --continue              Continue most recent conversation
+    --conversation ID            Continue specific conversation by UUID
+    --add-dir PATH               Add directory to workspace (repeatable)
+    --dangerously-skip-permissions  Auto-approve all tool requests
+    --log-file PATH              Override agy log file path
+    --print-timeout DURATION     agy-internal print timeout (e.g. 30s, 5m0s)
+    --sandbox                    Run in sandbox mode
+
+Our own flags (not forwarded):
+    --id-file PATH               Save new conversation UUID to file
+    --kill-timeout N             Seconds before force-killing agy process (default: 360)
 """
 
 import argparse
@@ -84,55 +97,116 @@ def find_response_in_db(db_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="agy -p wrapper: runs agy non-interactively and prints the response."
+        description="agy -p wrapper: runs agy non-interactively and prints the response.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
+    # ── prompt ──────────────────────────────────────────────────────────────
     parser.add_argument("prompt", nargs="+", help="Prompt to send to agy")
-    parser.add_argument(
+
+    # ── conversation flags (forwarded to agy) ────────────────────────────────
+    conv_group = parser.add_argument_group("conversation (forwarded to agy)")
+    conv_group.add_argument(
         "-c", "--continue", dest="cont", action="store_true",
         help="Continue the most recent agy conversation"
     )
-    parser.add_argument(
+    conv_group.add_argument(
         "--conversation", metavar="ID",
         help="Continue a specific conversation by UUID"
     )
-    parser.add_argument(
-        "--id-file", metavar="PATH",
-        help="Save the conversation ID to this file (new conversations only)"
-    )
-    parser.add_argument(
-        "--timeout", type=int, default=120, help="Max seconds to wait (default: 120)"
-    )
-    args = parser.parse_args()
 
+    # ── agy passthrough flags ────────────────────────────────────────────────
+    agy_group = parser.add_argument_group("agy flags (forwarded to agy)")
+    agy_group.add_argument(
+        "--add-dir", metavar="PATH", action="append", default=[],
+        help="Add a directory to the workspace (repeatable)"
+    )
+    agy_group.add_argument(
+        "--dangerously-skip-permissions", action="store_true",
+        help="Auto-approve all tool permission requests without prompting"
+    )
+    agy_group.add_argument(
+        "--log-file", metavar="PATH",
+        help="Override agy CLI log file path"
+    )
+    agy_group.add_argument(
+        "--print-timeout", metavar="DURATION",
+        help="agy-internal print mode timeout (e.g. 30s, 2m30s). Default: 5m0s"
+    )
+    agy_group.add_argument(
+        "--sandbox", action="store_true",
+        help="Run agy in sandbox with terminal restrictions enabled"
+    )
+
+    # ── our own flags (not forwarded) ────────────────────────────────────────
+    our_group = parser.add_argument_group("wrapper-only flags (not forwarded)")
+    our_group.add_argument(
+        "--id-file", metavar="PATH",
+        help="Save the new conversation UUID to this file"
+    )
+    our_group.add_argument(
+        "--kill-timeout", type=int, default=360, metavar="SECONDS",
+        help="Seconds before force-killing the agy process (default: 360)"
+    )
+
+    args = parser.parse_args()
     prompt = " ".join(args.prompt)
 
+    # ── build agy command ────────────────────────────────────────────────────
     cmd = [AGY_EXE]
+
+    # conversation flags
     if args.conversation:
         cmd += ["--conversation", args.conversation]
     elif args.cont:
         cmd.append("--continue")
+
+    # workspace
+    for d in args.add_dir:
+        cmd += ["--add-dir", d]
+
+    # boolean flags
+    if args.dangerously_skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+    if args.sandbox:
+        cmd.append("--sandbox")
+
+    # value flags
+    if args.log_file:
+        cmd += ["--log-file", args.log_file]
+    if args.print_timeout:
+        cmd += ["--print-timeout", args.print_timeout]
+
+    # prompt
     cmd += ["-p", prompt]
 
+    # ── run ──────────────────────────────────────────────────────────────────
     before = set(glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")))
 
-    result = subprocess.run(cmd, timeout=args.timeout)
+    try:
+        result = subprocess.run(cmd, timeout=args.kill_timeout)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            f"agy did not finish within {args.kill_timeout}s "
+            f"(use --kill-timeout to adjust, or --print-timeout to set agy's own timeout)\n"
+        )
+        sys.exit(1)
 
     if result.returncode != 0:
         sys.stderr.write(f"agy exited with code {result.returncode}\n")
         sys.exit(result.returncode)
 
+    # ── find the conversation DB ──────────────────────────────────────────────
     after = set(glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")))
     new_dbs = after - before
 
     if args.conversation:
-        # --conversation: same DB is updated, no new file
         target_db = os.path.join(CONVERSATIONS_DIR, f"{args.conversation}.db")
         conv_id = args.conversation
     elif new_dbs:
         target_db = max(new_dbs, key=os.path.getmtime)
         conv_id = os.path.splitext(os.path.basename(target_db))[0]
     else:
-        # --continue or fallback: most recently modified DB
         all_dbs = glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db"))
         if not all_dbs:
             sys.stderr.write("No conversation DB found.\n")
@@ -140,7 +214,7 @@ def main():
         target_db = max(all_dbs, key=os.path.getmtime)
         conv_id = os.path.splitext(os.path.basename(target_db))[0]
 
-    # Emit conversation ID for new conversations
+    # emit conversation ID for new conversations
     if new_dbs:
         sys.stderr.write(f"CONV_ID: {conv_id}\n")
         if args.id_file:
@@ -149,6 +223,7 @@ def main():
 
     time.sleep(0.5)
 
+    # ── extract and print response ────────────────────────────────────────────
     response = find_response_in_db(target_db)
     if response:
         sys.stdout.buffer.write((response + "\n").encode("utf-8"))
