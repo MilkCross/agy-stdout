@@ -18,6 +18,12 @@ Root cause of the bug (agy v1.0.4):
     ModifiedResponse. The actual text is saved to the SQLite conversation DB
     (gen_metadata table) even when stdout gets nothing. This script reads it back.
 
+Hang workaround (issue #134):
+    text_drip.go enters a busy-loop after streaming CJK (Japanese/Chinese/Korean)
+    text, causing agy to never exit. The response is already written to the DB
+    before text_drip starts animating, so this script polls the DB and kills the
+    process as soon as the response is found — without waiting for natural exit.
+
 Flags forwarded to agy:
     -c / --continue              Continue most recent conversation
     --conversation ID            Continue specific conversation by UUID
@@ -29,6 +35,7 @@ Flags forwarded to agy:
 
 Our own flags (not forwarded):
     --id-file PATH               Save new conversation UUID to file
+    --poll-interval N            DB poll interval in seconds (default: 0.3)
     --kill-timeout N             Seconds before force-killing agy process (default: 360)
 """
 
@@ -45,6 +52,20 @@ CONVERSATIONS_DIR = os.path.expandvars(
 AGY_EXE = os.path.expandvars(
     r"%LOCALAPPDATA%\agy\bin\agy.exe"
 )
+
+
+def _get_gm_count(db_path):
+    """Return the number of gen_metadata rows in the DB (0 if unavailable)."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM gen_metadata")
+        n = cur.fetchone()[0]
+        conn.close()
+        return n
+    except Exception:
+        return 0
 
 
 def find_response_in_db(db_path):
@@ -95,7 +116,130 @@ def find_response_in_db(db_path):
     return None
 
 
+def run_and_collect(cmd, before_dbs, conv_id_hint, use_continue, poll_interval, kill_timeout):
+    """
+    Run agy, poll the DB for the response, kill the process once found.
+
+    Returns (response_text, conv_id) or raises SystemExit on failure.
+    This avoids waiting for agy's natural exit, which may never come due to
+    the text_drip busy-loop bug triggered by CJK streaming (issue #134).
+    """
+    proc = subprocess.Popen(cmd)
+    start_time = time.monotonic()  # monotonic: unaffected by NTP/system clock changes
+
+    target_db = None
+    deadline = start_time + kill_timeout
+    response = None
+    conv_id = conv_id_hint  # pre-filled when --conversation was given
+
+    # For --continue: snapshot mtime of all existing DBs so we can detect
+    # which one gets updated (no new file is created).
+    before_mtimes = {}
+    before_gm_counts = {}  # db_path -> gen_metadata count before this run
+    if use_continue:
+        for p in glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")):
+            try:
+                before_mtimes[p] = os.path.getmtime(p)
+                before_gm_counts[p] = _get_gm_count(p)
+            except OSError:
+                pass
+
+    # For --conversation: track existing gen_metadata count in the target DB.
+    before_gm_count = 0
+    if conv_id_hint:
+        candidate = os.path.join(CONVERSATIONS_DIR, f"{conv_id_hint}.db")
+        before_gm_count = _get_gm_count(candidate)
+
+    try:
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval)
+
+            # ── discover the conversation DB ─────────────────────────────
+            if target_db is None:
+                if conv_id_hint:
+                    # --conversation ID: target DB is known upfront
+                    candidate = os.path.join(CONVERSATIONS_DIR, f"{conv_id_hint}.db")
+                    if os.path.exists(candidate):
+                        target_db = candidate
+                elif use_continue:
+                    # --continue: find the DB whose mtime changed since we started
+                    for p in glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")):
+                        try:
+                            if os.path.getmtime(p) > before_mtimes.get(p, 0):
+                                target_db = p
+                                conv_id = os.path.splitext(os.path.basename(p))[0]
+                                before_gm_count = before_gm_counts.get(p, 0)
+                                break
+                        except OSError:
+                            pass
+                else:
+                    # new conversation: look for a brand-new DB file
+                    current = set(glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")))
+                    new = current - before_dbs
+                    if new:
+                        target_db = max(new, key=os.path.getmtime)
+                        conv_id = os.path.splitext(os.path.basename(target_db))[0]
+
+            # ── check for response in DB ──────────────────────────────────
+            if target_db:
+                # For existing DBs (--continue / --conversation), only look at
+                # gen_metadata entries added after this run started.
+                if (conv_id_hint or use_continue) and _get_gm_count(target_db) <= before_gm_count:
+                    pass  # new entry not yet written
+                else:
+                    response = find_response_in_db(target_db)
+                if response:
+                    # Response is in DB — kill agy regardless of its exit state.
+                    # This is the key fix for the text_drip hang (issue #134):
+                    # agy may never exit naturally when streaming CJK text, but
+                    # the response is already persisted before text_drip starts.
+                    if proc.poll() is None:
+                        proc.kill()
+                    return response, conv_id
+
+            # ── check for natural exit without response ───────────────────
+            if proc.poll() is not None:
+                if proc.returncode != 0:
+                    sys.stderr.write(f"agy exited with code {proc.returncode}\n")
+                    sys.exit(proc.returncode)
+                # Exited cleanly but no response yet — give DB one last chance
+                time.sleep(0.5)
+                if target_db:
+                    response = find_response_in_db(target_db)
+                    if response:
+                        return response, conv_id
+                sys.stderr.write(
+                    f"agy exited cleanly but no response found in "
+                    f"{os.path.basename(target_db or 'DB')}.\n"
+                )
+                sys.exit(1)
+
+        # ── hard timeout ─────────────────────────────────────────────────
+        sys.stderr.write(
+            f"agy did not produce a response within {kill_timeout}s. "
+            f"(use --kill-timeout to adjust)\n"
+        )
+        sys.exit(1)
+
+    finally:
+        # Always clean up the agy process, even on Ctrl+C or sys.exit().
+        # Without this, a hung agy process (text_drip busy-loop) would
+        # keep consuming CPU after the wrapper terminates.
+        if proc.poll() is None:
+            proc.kill()
+
+
 def main():
+    # ── dependency check ─────────────────────────────────────────────────────
+    try:
+        import blackboxprotobuf  # noqa: F401
+    except ImportError:
+        sys.stderr.write(
+            "Error: blackboxprotobuf is required.\n"
+            "Install it with: pip install blackboxprotobuf\n"
+        )
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(
         description="agy -p wrapper: runs agy non-interactively and prints the response.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -145,6 +289,10 @@ def main():
         help="Save the new conversation UUID to this file"
     )
     our_group.add_argument(
+        "--poll-interval", type=float, default=0.3, metavar="SECONDS",
+        help="How often to check the DB for a response (default: 0.3)"
+    )
+    our_group.add_argument(
         "--kill-timeout", type=int, default=360, metavar="SECONDS",
         help="Seconds before force-killing the agy process (default: 360)"
     )
@@ -155,83 +303,47 @@ def main():
     # ── build agy command ────────────────────────────────────────────────────
     cmd = [AGY_EXE]
 
-    # conversation flags
     if args.conversation:
         cmd += ["--conversation", args.conversation]
     elif args.cont:
         cmd.append("--continue")
 
-    # workspace
     for d in args.add_dir:
         cmd += ["--add-dir", d]
 
-    # boolean flags
     if args.dangerously_skip_permissions:
         cmd.append("--dangerously-skip-permissions")
     if args.sandbox:
         cmd.append("--sandbox")
-
-    # value flags
     if args.log_file:
         cmd += ["--log-file", args.log_file]
     if args.print_timeout:
         cmd += ["--print-timeout", args.print_timeout]
 
-    # prompt
     cmd += ["-p", prompt]
 
-    # ── run ──────────────────────────────────────────────────────────────────
-    before = set(glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")))
+    # ── snapshot DB state before running ─────────────────────────────────────
+    before_dbs = set(glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")))
 
-    try:
-        result = subprocess.run(cmd, timeout=args.kill_timeout)
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(
-            f"agy did not finish within {args.kill_timeout}s "
-            f"(use --kill-timeout to adjust, or --print-timeout to set agy's own timeout)\n"
-        )
-        sys.exit(1)
+    # ── run agy and collect response via DB polling ───────────────────────────
+    response, conv_id = run_and_collect(
+        cmd=cmd,
+        before_dbs=before_dbs,
+        conv_id_hint=args.conversation,
+        use_continue=args.cont,
+        poll_interval=args.poll_interval,
+        kill_timeout=args.kill_timeout,
+    )
 
-    if result.returncode != 0:
-        sys.stderr.write(f"agy exited with code {result.returncode}\n")
-        sys.exit(result.returncode)
-
-    # ── find the conversation DB ──────────────────────────────────────────────
-    after = set(glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")))
-    new_dbs = after - before
-
-    if args.conversation:
-        target_db = os.path.join(CONVERSATIONS_DIR, f"{args.conversation}.db")
-        conv_id = args.conversation
-    elif new_dbs:
-        target_db = max(new_dbs, key=os.path.getmtime)
-        conv_id = os.path.splitext(os.path.basename(target_db))[0]
-    else:
-        all_dbs = glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db"))
-        if not all_dbs:
-            sys.stderr.write("No conversation DB found.\n")
-            sys.exit(1)
-        target_db = max(all_dbs, key=os.path.getmtime)
-        conv_id = os.path.splitext(os.path.basename(target_db))[0]
-
-    # emit conversation ID for new conversations
-    if new_dbs:
+    # ── emit conversation ID for new conversations ────────────────────────────
+    if not args.conversation and not args.cont:
         sys.stderr.write(f"CONV_ID: {conv_id}\n")
         if args.id_file:
             with open(args.id_file, "w") as f:
                 f.write(conv_id)
 
-    time.sleep(0.5)
-
-    # ── extract and print response ────────────────────────────────────────────
-    response = find_response_in_db(target_db)
-    if response:
-        sys.stdout.buffer.write((response + "\n").encode("utf-8"))
-    else:
-        sys.stderr.write(
-            f"Could not extract response from {os.path.basename(target_db)}.\n"
-        )
-        sys.exit(1)
+    # ── print response ────────────────────────────────────────────────────────
+    sys.stdout.buffer.write((response + "\n").encode("utf-8"))
 
 
 if __name__ == "__main__":

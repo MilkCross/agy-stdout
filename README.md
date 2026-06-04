@@ -1,19 +1,20 @@
 # agy-stdout
 
-`agy -p`（`--print`）フラグが stdout に何も出力しないバグ（v1.0.4 時点）を回避するラッパースクリプトです。
+`agy -p`（`--print`）フラグが stdout に何も出力しないバグ（v1.0.4 時点）と、
+日本語/CJK テキストのストリーミング後にプロセスがハングするバグを回避するラッパースクリプトです。
 
 ## 背景・問題
 
-[Antigravity CLI (agy)](https://github.com/google-antigravity/antigravity-cli) の `-p` / `--print` フラグは、非インタラクティブに一問一答する用途で設計されています。  
-しかし v1.0.4 時点では、パイプ・リダイレクト・サブプロセス経由で実行すると **stdout に何も出力されない** バグがあります（exit code は 0）。
+[Antigravity CLI (agy)](https://github.com/google-antigravity/antigravity-cli) には v1.0.4 時点で 2 つのバグがあります。
+
+### バグ 1: `-p` フラグが stdout に何も出力しない
+
+`-p` / `--print` フラグは非インタラクティブに一問一答する用途で設計されていますが、
+パイプ・リダイレクト・サブプロセス経由で実行すると **stdout に何も出力されない**バグがあります（exit code は 0）。
 
 - 関連 issue: [#76](https://github.com/google-antigravity/antigravity-cli/issues/76) · [#187](https://github.com/google-antigravity/antigravity-cli/issues/187) · [#231](https://github.com/google-antigravity/antigravity-cli/issues/231)
-- いずれも未解決・公式対応なし（2026-06-03 時点）
 
-### 根本原因
-
-`printmode_manager.go` が `PlannerResponse` に `ModifiedResponse` が含まれない場合に出力をスキップします。  
-ただし **モデルの応答テキストは SQLite の会話 DB に正常に保存されている**ため、そこから読み出すことで回避できます。
+**根本原因**: `printmode_manager.go` が `PlannerResponse` に `ModifiedResponse` が含まれない場合に出力をスキップします。ただし **モデルの応答テキストは SQLite の会話 DB に正常に保存されている**ため、そこから読み出すことで回避できます。
 
 ```
 ~/.gemini/antigravity-cli/conversations/{uuid}.db
@@ -21,6 +22,34 @@
         └── protobuf バイナリ
               └── field .1.2[N].3 = モデルの応答テキスト
 ```
+
+### バグ 2: 日本語/CJK テキストのストリーミング後にプロセスがハングする
+
+日本語・中国語・韓国語などの CJK テキストを含む応答をストリーミングすると、
+`text_drip.go` がアニメーション中にビジーループに入り、**プロセスが永遠に終了しない**ことがあります。
+
+- 関連 issue: [#134](https://github.com/google-antigravity/antigravity-cli/issues/134) · [#168](https://github.com/google-antigravity/antigravity-cli/issues/168) · [#183](https://github.com/google-antigravity/antigravity-cli/issues/183)
+
+**根本原因**: UTF-8 マルチバイト文字がストリームチャンクをまたいで分割されると、
+drip バッファが不正バイト列として処理できなくなり `charIdx` が `length` に到達しないまま無限ループに入ります。
+
+**重要な発見**: 実測により、**モデルの応答は `text_drip` のアニメーション開始前に DB へ書き込まれる**ことが確認されています。
+つまり `text_drip` がハングしていても、応答テキストは DB に保存済みです。
+
+```
+① API からストリーム受信（完了）
+   ↓
+② DB に応答テキストを書き込む  ← 正常に完了
+   ↓
+③ text_drip がアニメーション開始  ← ここでハングする可能性あり
+   ↓（CJK テキストでビジーループ）
+④ プロセスが終了しない（SIGKILL でのみ停止）
+```
+
+**対策**: DB に応答が書き込まれた時点でプロセスを強制終了することで、
+ハングの有無にかかわらず確実に応答を取得できます。
+
+すべての issue は未解決・公式対応なし（2026-06-04 時点）。
 
 ## インストール
 
@@ -60,23 +89,14 @@ python agy_p.py --conversation "$(cat /tmp/conv.txt)" "続きのメッセージ"
 ### ワークスペースにディレクトリを追加する
 
 ```bash
-# 単一ディレクトリ
-python agy_p.py --add-dir ./src "src ディレクトリの .py ファイルを列挙して"
-
-# 複数ディレクトリ（繰り返し指定可）
 python agy_p.py --add-dir ./src --add-dir ./tests "テストカバレッジを確認して"
 ```
 
-### ツール確認を全スキップする
+### ツール確認をスキップ・サンドボックス実行
 
 ```bash
 python agy_p.py --dangerously-skip-permissions "ファイルを編集して"
-```
-
-### サンドボックスモードで実行する
-
-```bash
-python agy_p.py --sandbox "コードを実行して結果を教えて"
+python agy_p.py --sandbox "コードを実行して"
 ```
 
 ### タイムアウトを調整する
@@ -84,16 +104,9 @@ python agy_p.py --sandbox "コードを実行して結果を教えて"
 ```bash
 # agy 内部タイムアウト（デフォルト 5m0s）
 python agy_p.py --print-timeout 30s "簡単な質問"
-python agy_p.py --print-timeout 10m0s "複雑な処理"
 
 # プロセス強制終了タイムアウト（デフォルト 360 秒）
 python agy_p.py --kill-timeout 600 "時間のかかる処理"
-```
-
-### ログファイルを指定する
-
-```bash
-python agy_p.py --log-file /tmp/agy.log "質問"
 ```
 
 ## オプション一覧
@@ -115,6 +128,7 @@ python agy_p.py --log-file /tmp/agy.log "質問"
 | オプション | 説明 |
 |-----------|------|
 | `--id-file PATH` | 新規会話の UUID をファイルに保存 |
+| `--poll-interval N` | DB をチェックする間隔（秒、デフォルト: 0.3） |
 | `--kill-timeout N` | プロセス強制終了までの秒数（デフォルト: 360） |
 
 ## 動作環境
@@ -127,7 +141,7 @@ python agy_p.py --log-file /tmp/agy.log "質問"
 ## 注意事項
 
 - `agy.exe` のパスは `%LOCALAPPDATA%\agy\bin\agy.exe` を想定しています。異なる場合はスクリプト内の `AGY_EXE` を変更してください。
-- このバグが公式に修正された場合、本スクリプトは不要になります。
+- これらのバグが公式に修正された場合、本スクリプトは不要になります。
 
 ## ライセンス
 
