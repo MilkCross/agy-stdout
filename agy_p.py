@@ -27,6 +27,7 @@ Hang workaround (issue #134):
 Flags forwarded to agy:
     -c / --continue              Continue most recent conversation
     --conversation ID            Continue specific conversation by UUID
+    --model MODEL                Model to use (e.g. gemini-2.5-pro, gemini-2.5-flash)
     --add-dir PATH               Add directory to workspace (repeatable)
     --dangerously-skip-permissions  Auto-approve all tool requests
     --log-file PATH              Override agy log file path
@@ -118,11 +119,19 @@ def find_response_in_db(db_path):
 
 def run_and_collect(cmd, before_dbs, conv_id_hint, use_continue, poll_interval, kill_timeout):
     """
-    Run agy, poll the DB for the response, kill the process once found.
+    Run agy, wait for it to exit naturally, then read the response from the DB.
 
     Returns (response_text, conv_id) or raises SystemExit on failure.
-    This avoids waiting for agy's natural exit, which may never come due to
-    the text_drip busy-loop bug triggered by CJK streaming (issue #134).
+
+    Strategy change from v1.0.6+:
+    - Previously we killed agy as soon as the first gen_metadata row appeared,
+      to work around the text_drip CJK busy-loop (issue #134).
+    - v1.0.6 fixed that hang, so we now wait for natural exit instead.
+      This is required for models that use multi-step tool calls (e.g.
+      gemini-2.5-pro): killing on the first DB write would abort the run
+      mid-tool-chain and return an intermediate tool result instead of the
+      final model response.
+    - The kill-timeout still force-kills agy if it never exits (safety net).
     """
     proc = subprocess.Popen(cmd)
     start_time = time.monotonic()  # monotonic: unaffected by NTP/system clock changes
@@ -150,6 +159,11 @@ def run_and_collect(cmd, before_dbs, conv_id_hint, use_continue, poll_interval, 
         candidate = os.path.join(CONVERSATIONS_DIR, f"{conv_id_hint}.db")
         before_gm_count = _get_gm_count(candidate)
 
+    # For new conversations: track ALL new DB files created during this run.
+    # agy can create more than one DB file per invocation; we must poll each
+    # candidate and pick the first one that receives a gen_metadata entry.
+    new_dbs_seen = set()
+
     try:
         while time.monotonic() < deadline:
             time.sleep(poll_interval)
@@ -173,38 +187,32 @@ def run_and_collect(cmd, before_dbs, conv_id_hint, use_continue, poll_interval, 
                         except OSError:
                             pass
                 else:
-                    # new conversation: look for a brand-new DB file
+                    # new conversation: accumulate ALL new DB files and poll each
+                    # one — agy may create multiple DBs in one run, and the
+                    # response is not necessarily in the newest file by mtime.
                     current = set(glob.glob(os.path.join(CONVERSATIONS_DIR, "*.db")))
-                    new = current - before_dbs
-                    if new:
-                        target_db = max(new, key=os.path.getmtime)
-                        conv_id = os.path.splitext(os.path.basename(target_db))[0]
+                    new_dbs_seen |= current - before_dbs
+                    for db in new_dbs_seen:
+                        if _get_gm_count(db) > 0:
+                            target_db = db
+                            conv_id = os.path.splitext(os.path.basename(db))[0]
+                            break
 
-            # ── check for response in DB ──────────────────────────────────
-            if target_db:
-                # For existing DBs (--continue / --conversation), only look at
-                # gen_metadata entries added after this run started.
-                if (conv_id_hint or use_continue) and _get_gm_count(target_db) <= before_gm_count:
-                    pass  # new entry not yet written
-                else:
-                    response = find_response_in_db(target_db)
-                if response:
-                    # Response is in DB — kill agy regardless of its exit state.
-                    # This is the key fix for the text_drip hang (issue #134):
-                    # agy may never exit naturally when streaming CJK text, but
-                    # the response is already persisted before text_drip starts.
-                    if proc.poll() is None:
-                        proc.kill()
-                    return response, conv_id
-
-            # ── check for natural exit without response ───────────────────
+            # ── wait for natural exit ─────────────────────────────────────
             if proc.poll() is not None:
                 if proc.returncode != 0:
                     sys.stderr.write(f"agy exited with code {proc.returncode}\n")
                     sys.exit(proc.returncode)
-                # Exited cleanly but no response yet — give DB one last chance
+                # Process exited cleanly — give DB a moment to flush writes
                 time.sleep(0.5)
                 if target_db:
+                    # For existing DBs, verify a new entry was actually written
+                    if (conv_id_hint or use_continue) and _get_gm_count(target_db) <= before_gm_count:
+                        sys.stderr.write(
+                            f"agy exited cleanly but no new response written to "
+                            f"{os.path.basename(target_db)}.\n"
+                        )
+                        sys.exit(1)
                     response = find_response_in_db(target_db)
                     if response:
                         return response, conv_id
@@ -214,17 +222,23 @@ def run_and_collect(cmd, before_dbs, conv_id_hint, use_continue, poll_interval, 
                 )
                 sys.exit(1)
 
-        # ── hard timeout ─────────────────────────────────────────────────
+        # ── hard timeout: force-kill and return whatever is in the DB ─────
         sys.stderr.write(
-            f"agy did not produce a response within {kill_timeout}s. "
+            f"agy did not exit within {kill_timeout}s; force-killing. "
             f"(use --kill-timeout to adjust)\n"
         )
+        if proc.poll() is None:
+            proc.kill()
+        time.sleep(0.5)
+        if target_db:
+            response = find_response_in_db(target_db)
+            if response:
+                sys.stderr.write("Returning partial response from DB after timeout.\n")
+                return response, conv_id
         sys.exit(1)
 
     finally:
         # Always clean up the agy process, even on Ctrl+C or sys.exit().
-        # Without this, a hung agy process (text_drip busy-loop) would
-        # keep consuming CPU after the wrapper terminates.
         if proc.poll() is None:
             proc.kill()
 
@@ -261,6 +275,10 @@ def main():
 
     # ── agy passthrough flags ────────────────────────────────────────────────
     agy_group = parser.add_argument_group("agy flags (forwarded to agy)")
+    agy_group.add_argument(
+        "--model", metavar="MODEL",
+        help="Model to use for this session (e.g. gemini-2.5-pro, gemini-2.5-flash)"
+    )
     agy_group.add_argument(
         "--add-dir", metavar="PATH", action="append", default=[],
         help="Add a directory to the workspace (repeatable)"
@@ -311,6 +329,8 @@ def main():
     for d in args.add_dir:
         cmd += ["--add-dir", d]
 
+    if args.model:
+        cmd += ["--model", args.model]
     if args.dangerously_skip_permissions:
         cmd.append("--dangerously-skip-permissions")
     if args.sandbox:

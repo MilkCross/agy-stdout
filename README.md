@@ -1,20 +1,19 @@
 # agy-stdout
 
-`agy -p`（`--print`）フラグが stdout に何も出力しないバグ（v1.0.4 時点）と、
-日本語/CJK テキストのストリーミング後にプロセスがハングするバグを回避するラッパースクリプトです。
+`agy -p`（`--print`）フラグが stdout に何も出力しないバグ（v1.0.4 時点）を回避するラッパースクリプトです。
 
 ## 背景・問題
 
-[Antigravity CLI (agy)](https://github.com/google-antigravity/antigravity-cli) には v1.0.4 時点で 2 つのバグがあります。
-
-### バグ 1: `-p` フラグが stdout に何も出力しない
-
-`-p` / `--print` フラグは非インタラクティブに一問一答する用途で設計されていますが、
-パイプ・リダイレクト・サブプロセス経由で実行すると **stdout に何も出力されない**バグがあります（exit code は 0）。
+[Antigravity CLI (agy)](https://github.com/google-antigravity/antigravity-cli) の `-p` / `--print` フラグは、非インタラクティブに一問一答する用途で設計されています。  
+しかし v1.0.4〜v1.0.6 時点では、パイプ・リダイレクト・サブプロセス経由で実行すると **stdout に何も出力されない** バグがあります（exit code は 0）。
 
 - 関連 issue: [#76](https://github.com/google-antigravity/antigravity-cli/issues/76) · [#187](https://github.com/google-antigravity/antigravity-cli/issues/187) · [#231](https://github.com/google-antigravity/antigravity-cli/issues/231)
+- いずれも未解決・公式対応なし（2026-06-09 時点）
 
-**根本原因**: `printmode_manager.go` が `PlannerResponse` に `ModifiedResponse` が含まれない場合に出力をスキップします。ただし **モデルの応答テキストは SQLite の会話 DB に正常に保存されている**ため、そこから読み出すことで回避できます。
+### 根本原因
+
+`printmode_manager.go` が `PlannerResponse` に `ModifiedResponse` が含まれない場合に出力をスキップします。  
+ただし **モデルの応答テキストは SQLite の会話 DB に正常に保存されている**ため、そこから読み出すことで回避できます。
 
 ```
 ~/.gemini/antigravity-cli/conversations/{uuid}.db
@@ -23,33 +22,11 @@
               └── field .1.2[N].3 = モデルの応答テキスト
 ```
 
-### バグ 2: 日本語/CJK テキストのストリーミング後にプロセスがハングする
+### v1.0.6 での CJK ハング修正について
 
-日本語・中国語・韓国語などの CJK テキストを含む応答をストリーミングすると、
-`text_drip.go` がアニメーション中にビジーループに入り、**プロセスが永遠に終了しない**ことがあります。
+v1.0.4〜v1.0.5 では日本語/CJK テキストのストリーミング後にプロセスがハングする別のバグ（issue [#134](https://github.com/google-antigravity/antigravity-cli/issues/134)）が存在しましたが、**v1.0.6 で修正**されています。
 
-- 関連 issue: [#134](https://github.com/google-antigravity/antigravity-cli/issues/134) · [#168](https://github.com/google-antigravity/antigravity-cli/issues/168) · [#183](https://github.com/google-antigravity/antigravity-cli/issues/183)
-
-**根本原因**: UTF-8 マルチバイト文字がストリームチャンクをまたいで分割されると、
-drip バッファが不正バイト列として処理できなくなり `charIdx` が `length` に到達しないまま無限ループに入ります。
-
-**重要な発見**: 実測により、**モデルの応答は `text_drip` のアニメーション開始前に DB へ書き込まれる**ことが確認されています。
-つまり `text_drip` がハングしていても、応答テキストは DB に保存済みです。
-
-```
-① API からストリーム受信（完了）
-   ↓
-② DB に応答テキストを書き込む  ← 正常に完了
-   ↓
-③ text_drip がアニメーション開始  ← ここでハングする可能性あり
-   ↓（CJK テキストでビジーループ）
-④ プロセスが終了しない（SIGKILL でのみ停止）
-```
-
-**対策**: DB に応答が書き込まれた時点でプロセスを強制終了することで、
-ハングの有無にかかわらず確実に応答を取得できます。
-
-すべての issue は未解決・公式対応なし（2026-06-04 時点）。
+本スクリプトは v1.0.6 以降を前提とし、**プロセスの自然終了**を待ってから DB を読み出す方式を採用しています。これにより `gemini-2.5-pro` などのツール呼び出しを行うモデルでも、ツールチェーン完了後の最終応答を正確に取得できます。
 
 ## インストール
 
@@ -65,6 +42,13 @@ pip install blackboxprotobuf
 
 ```bash
 python agy_p.py "あなたの質問"
+```
+
+### モデルを指定する（v1.0.5+ で追加）
+
+```bash
+python agy_p.py --model gemini-2.5-flash "質問"
+python agy_p.py --model gemini-2.5-pro   "質問"
 ```
 
 ### 会話を継続する
@@ -113,15 +97,16 @@ python agy_p.py --kill-timeout 600 "時間のかかる処理"
 
 ### agy に転送されるフラグ
 
-| オプション | 説明 |
-|-----------|------|
-| `-c` / `--continue` | 直前の会話を継続 |
-| `--conversation ID` | 指定した UUID の会話を継続 |
-| `--add-dir PATH` | ワークスペースにディレクトリを追加（複数回指定可） |
-| `--dangerously-skip-permissions` | ツール確認を全スキップ |
-| `--log-file PATH` | agy のログ出力先を上書き |
-| `--print-timeout DURATION` | agy 内部の print モードタイムアウト（例: `30s`, `5m0s`） |
-| `--sandbox` | サンドボックスモードで実行 |
+| オプション | 説明 | 追加バージョン |
+|-----------|------|------|
+| `-c` / `--continue` | 直前の会話を継続 | v1.0.4 |
+| `--conversation ID` | 指定した UUID の会話を継続 | v1.0.4 |
+| `--model MODEL` | 使用するモデルを指定（例: `gemini-2.5-pro`, `gemini-2.5-flash`） | v1.0.5 |
+| `--add-dir PATH` | ワークスペースにディレクトリを追加（複数回指定可） | v1.0.4 |
+| `--dangerously-skip-permissions` | ツール確認を全スキップ | v1.0.4 |
+| `--log-file PATH` | agy のログ出力先を上書き | v1.0.4 |
+| `--print-timeout DURATION` | agy 内部の print モードタイムアウト（例: `30s`, `5m0s`） | v1.0.4 |
+| `--sandbox` | サンドボックスモードで実行 | v1.0.4 |
 
 ### ラッパー独自フラグ（agy には転送されない）
 
@@ -135,13 +120,13 @@ python agy_p.py --kill-timeout 600 "時間のかかる処理"
 
 - Windows 10 / 11
 - Python 3.x
-- [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) v1.0.4
+- [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) **v1.0.6 以降を推奨**
 - `pip install blackboxprotobuf`
 
 ## 注意事項
 
 - `agy.exe` のパスは `%LOCALAPPDATA%\agy\bin\agy.exe` を想定しています。異なる場合はスクリプト内の `AGY_EXE` を変更してください。
-- これらのバグが公式に修正された場合、本スクリプトは不要になります。
+- stdout バグが公式に修正された場合、本スクリプトは不要になります。
 
 ## ライセンス
 
