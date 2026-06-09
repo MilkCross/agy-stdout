@@ -27,7 +27,11 @@ Hang workaround (issue #134):
 Flags forwarded to agy:
     -c / --continue              Continue most recent conversation
     --conversation ID            Continue specific conversation by UUID
-    --model MODEL                Model to use (e.g. gemini-2.5-pro, gemini-2.5-flash)
+    --model MODEL                Model to use. Valid internal labels:
+                                   "Gemini 3.5 Flash (Low)"    — default (fast)
+                                   "Gemini 3.5 Flash (Medium)" — balanced
+                                   "Gemini 3.5 Flash (High)"   — max capability
+                                 Any other value silently falls back to Medium.
     --add-dir PATH               Add directory to workspace (repeatable)
     --dangerously-skip-permissions  Auto-approve all tool requests
     --log-file PATH              Override agy log file path
@@ -277,7 +281,14 @@ def main():
     agy_group = parser.add_argument_group("agy flags (forwarded to agy)")
     agy_group.add_argument(
         "--model", metavar="MODEL",
-        help="Model to use for this session (e.g. gemini-2.5-pro, gemini-2.5-flash)"
+        help=(
+            'Model to use for this session. '
+            'Valid values (internal labels): '
+            '"Gemini 3.5 Flash (Low)" (default), '
+            '"Gemini 3.5 Flash (Medium)", '
+            '"Gemini 3.5 Flash (High)". '
+            'Any other value silently falls back to Medium.'
+        )
     )
     agy_group.add_argument(
         "--add-dir", metavar="PATH", action="append", default=[],

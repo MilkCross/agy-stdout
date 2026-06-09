@@ -46,9 +46,19 @@ python agy_p.py "あなたの質問"
 
 ### モデルを指定する（v1.0.5+ で追加）
 
+`--model` には **agy 内部ラベル** をそのまま指定します。
+
+| 指定値 | 説明 |
+|--------|------|
+| `"Gemini 3.5 Flash (Low)"` | デフォルト。高速・低コスト |
+| `"Gemini 3.5 Flash (Medium)"` | バランス型（未知の名前指定時のフォールバック） |
+| `"Gemini 3.5 Flash (High)"` | 最大性能 |
+
+> **注意**: `gemini-2.5-pro` や `gemini-2.5-flash` などの Gemini API スタイルの名前は認識されず、すべて `Gemini 3.5 Flash (Medium)` にフォールバックします。
+
 ```bash
-python agy_p.py --model gemini-2.5-flash "質問"
-python agy_p.py --model gemini-2.5-pro   "質問"
+python agy_p.py --model "Gemini 3.5 Flash (High)" "複雑な質問"
+python agy_p.py --model "Gemini 3.5 Flash (Low)"  "簡単な質問（高速）"
 ```
 
 ### 会話を継続する
@@ -101,7 +111,7 @@ python agy_p.py --kill-timeout 600 "時間のかかる処理"
 |-----------|------|------|
 | `-c` / `--continue` | 直前の会話を継続 | v1.0.4 |
 | `--conversation ID` | 指定した UUID の会話を継続 | v1.0.4 |
-| `--model MODEL` | 使用するモデルを指定（例: `gemini-2.5-pro`, `gemini-2.5-flash`） | v1.0.5 |
+| `--model MODEL` | 使用するモデルを指定。有効値: `"Gemini 3.5 Flash (Low)"` / `"(Medium)"` / `"(High)"` | v1.0.5 |
 | `--add-dir PATH` | ワークスペースにディレクトリを追加（複数回指定可） | v1.0.4 |
 | `--dangerously-skip-permissions` | ツール確認を全スキップ | v1.0.4 |
 | `--log-file PATH` | agy のログ出力先を上書き | v1.0.4 |
