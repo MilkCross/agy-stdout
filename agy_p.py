@@ -137,7 +137,11 @@ def run_and_collect(cmd, before_dbs, conv_id_hint, use_continue, poll_interval, 
       final model response.
     - The kill-timeout still force-kills agy if it never exits (safety net).
     """
-    proc = subprocess.Popen(cmd)
+    # Redirect the child's stdout to avoid duplicate output: agy v1.0.15+
+    # writes its own response directly to stdout, and we separately print
+    # the response read from the DB below. Without this, the same text
+    # would appear twice.
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL)
     start_time = time.monotonic()  # monotonic: unaffected by NTP/system clock changes
 
     target_db = None
